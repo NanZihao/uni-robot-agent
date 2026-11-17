@@ -176,12 +176,18 @@ class Robot(Contract):
     required_cameras: list[str]
     calibration: FileRef
     motion_profiles: dict[Literal["standard", "approach", "precision"], MotionProfile]
+    tracking_limits: TrackingLimits = Field(default_factory=TrackingLimits)
     action_timeout_s: FiniteFloat = Field(gt=0, le=60)
     stop_timeout_s: FiniteFloat = Field(gt=0, le=30)
     feedback_max_age_s: FiniteFloat = Field(gt=0, le=.1)
     feedback_max_skew_s: FiniteFloat = Field(gt=0, le=.05)
     control_frequency_hz: FiniteFloat = Field(gt=0, le=30)
     max_episode_steps: int = Field(gt=0)
+
+    @field_validator("tracking_limits", mode="before")
+    @classmethod
+    def tracking(cls, value):
+        return TrackingLimits.from_config(value)
 
     @model_validator(mode="after")
     def roles(self):
@@ -399,7 +405,7 @@ class Installation:
                 "grasp_site": a.grasp_site, "grasp_site_description": a.grasp_site_description,
                 "rotation_radius_m": c.rotation_radius_m, "joint_names": self.model.joint_names,
                 "joint_lower": c.joint_lower, "joint_upper": c.joint_upper,
-                "tracking_tolerance_rad": TrackingLimits().settle_joint_rad,
+                "tracking_tolerance_rad": self.robot.tracking_limits.settle_joint_rad,
                 "kinematics": {"urdf": self.urdf, "sha256": self.model.urdf.sha256,
                     "root_link": self.model.root_link, "tip_link": self.model.tip_link,
                     "joint_offsets_rad": c.kinematic_joint_offsets_rad,

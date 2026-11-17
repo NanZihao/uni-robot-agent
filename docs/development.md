@@ -233,6 +233,13 @@ not wait behind the movement it is meant to stop. A software hold/cancel is not
 a hardware emergency stop. Preserve native limits and authorization semantics.
 Task success comes from the environment or external assessment, not tool success.
 
+Native settling belongs to the hardware adapter and can have independently
+commissioned tolerances and confirmation budgets. Shared motion profiles judge
+the final measured tool target. Preserve native hold and arrival evidence in
+operation receipts and translate supported `hold_reports` through the existing
+environment diagnostics. Keep cumulative hold references with the native
+controller's lifecycle. See the [Piper-X settling contract](../uni_robot_agent/integrations/piper_x/README.md#native-settling-and-joint-holds).
+
 ## Add a planner
 
 Implement the plugin under `agents/<name>/` and register its lazy import in

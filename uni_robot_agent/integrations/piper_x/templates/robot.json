@@ -68,6 +68,15 @@
       "orientation_tolerance_rad": null
     }
   },
+  "tracking_limits": {
+    "settle_position_m": 0.03,
+    "settle_rotation_rad": 0.2,
+    "settle_joint_rad": 0.1,
+    "settle_gripper_opening": 0.05,
+    "settle_duration_s": 0.05,
+    "settle_max_gap_s": 0.04,
+    "settle_timeout_s": 0.6
+  },
   "action_timeout_s": null,
   "stop_timeout_s": null,
   "feedback_max_age_s": null,

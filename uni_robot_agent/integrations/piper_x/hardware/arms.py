@@ -6,14 +6,14 @@ from contextlib import ExitStack
 import math
 import threading
 import time
+import uuid
 
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 from uni_robot_agent.integrations.piper_x.body.core.arm.eef import coordinate_metadata
 from uni_robot_agent.integrations.piper_x.body.core.arm.arrival import ArrivalWindow
-from uni_robot_agent.integrations.piper_x.body.core.arm.tracking import PoseTrackingGuard, TrackingLimits
-from uni_robot_agent.integrations.piper_x.body.core.arm.motion_limits import MotionLimits
+from uni_robot_agent.integrations.piper_x.body.core.arm.tracking import PoseTrackingGuard
 from uni_robot_agent.integrations.piper_x.body.core.contract import DeviceError, ErrorCode
 from uni_robot_agent.integrations.piper_x.body.core.manifest import BodyManifest, DeviceManifest, Signal, Procedure, ObservationStreamSpec, num
 from uni_robot_agent.integrations.piper_x.body.core.observations import ObservationBuffer
@@ -21,7 +21,7 @@ from uni_robot_agent.integrations.piper_x.body.core.resources import ResourceLoc
 from ..config import Installation
 from .identity import verify_can
 from .planning import RobotGeometry
-from .path import ControlSitePath
+from .path import ControlSitePath, JointTrajectory
 from .transport import PassiveCan, SdkWriter
 from uni_robot_agent.integrations.piper_x.environment.kinematics import Kinematics, distance, from_eef
 
@@ -40,7 +40,9 @@ class ArmBody:
         self._dispatch_lock = threading.Lock()
         self._stop_lock = threading.Lock()
         self._stop_receipt = None
-        self.tracking_limits = TrackingLimits()
+        self._resume_stop_id: str | None = None
+        self.tracking_limits = self.robot.tracking_limits
+        self._hold_references: dict[str, dict] = {}
         self._readers, self._writers = {}, {}
         self._by_device = {a.device_id: name for name, a in self.robot.arms.items()}
         self._histories = {d: ObservationBuffer() for d in self._by_device}
@@ -119,7 +121,10 @@ class ArmBody:
                     "move_eef_group": Procedure("move_eef_group", "Preflight every arm before any dispatch", params={
                         "targets": {"type": "object"}, "max_segments": {"type": "integer", "minimum": 1, "maximum": 24},
                         "segment_m": num(.0001, .06), "max_duration_s": num(.1, 60)},
-                        required=["targets", "max_segments", "segment_m", "max_duration_s"], completion="measured_target_arrival")} if self.execute else {},
+                        required=["targets", "max_segments", "segment_m", "max_duration_s"], completion="measured_target_arrival"),
+                    "resume_control": Procedure("resume_control", "Reopen native admission after an evidenced tracking stop",
+                        params={"stop_id": {"type": "string", "minLength": 1}}, required=["stop_id"],
+                        completion="native_admission_resumed")} if self.execute else {},
                 metadata={"identity": self.installation.identity(name, "arms"),
                     "joint_limits_rad": {"lower": c.joint_lower, "upper": c.joint_upper},
                     "motion_limits": c.motion_limits.model_dump(), "eef_coordinates": coordinate_metadata(arm.device_id),
@@ -191,30 +196,76 @@ class ArmBody:
                         execution_outcome="none", stage="preflight") from error
                 time.sleep(.005)
 
-    def _arrival_error(self, name, data, target_q, *, held):
+    def _arrival_error(self, name, data, target_q, *, held, require_open=False):
         """Cartesian requests settle at the grasp site; held arms settle in joints."""
         c = self.installation.calibration.arms[name]
         joint_error = float(np.max(np.abs(np.asarray(data["joints_rad"]) - target_q)))
         evidence = {"max_joint_error_rad": joint_error}
+        open_ok = True
+        if require_open:
+            width = data["agx_gripper"].get("width_m")
+            opening = ((width - c.gripper_closed_m) / (c.gripper_open_m - c.gripper_closed_m)
+                       if type(width) in (int, float) and math.isfinite(width) else None)
+            open_ok = opening is not None and abs(1. - opening) <= self.tracking_limits.settle_gripper_opening
+            evidence.update(gripper_opening=opening, gripper_opening_measured=opening is not None,
+                            gripper_open_verified=open_ok,
+                            gripper_opening_tolerance=self.tracking_limits.settle_gripper_opening)
         if held:
             evidence["joint_tolerance_rad"] = self.tracking_limits.settle_joint_rad
-            return joint_error <= self.tracking_limits.settle_joint_rad, evidence
+            return open_ok and joint_error <= self.tracking_limits.settle_joint_rad, evidence
         offset = np.asarray(c.T_flange_from_grasp)
         measured = self._measured_flange(name, data) @ offset
         target = self.geometry.fk(name, target_q) @ offset
         position, rotation = distance(measured, target)
-        # Apply the strictest configured profile: a native call cannot loosen
-        # the selected tool profile, even though that profile is not sent here.
-        position_limit = min(p.position_tolerance_m for p in self.robot.motion_profiles.values())
-        rotation_limit = min(p.orientation_tolerance_rad for p in self.robot.motion_profiles.values())
-        if self.robot.motion_validation == "command_limits":
-            # Match ARX's native settle envelope. Shared tools still assess the
-            # selected standard/approach/precision profile at the grasp site.
-            position_limit = self.tracking_limits.position_m
-            rotation_limit = self.tracking_limits.rotation_rad
+        position_limit = self.tracking_limits.settle_position_m
+        rotation_limit = self.tracking_limits.settle_rotation_rad
         evidence.update(position_error_m=position, rotation_error_rad=rotation,
                         position_tolerance_m=position_limit, orientation_tolerance_rad=rotation_limit)
-        return position <= position_limit and rotation <= rotation_limit, evidence
+        return open_ok and position <= position_limit and rotation <= rotation_limit, evidence
+
+    def _hold_monitors(self, targets: dict, actual: dict) -> dict:
+        monitors = {}
+        for name, target in targets.items():
+            if "hold_joints" in target:
+                reference = self._hold_references.setdefault(name, {
+                    "joints_rad": list(actual[name]["joints_rad"]),
+                    "grasp_pose": (self._measured_flange(name, actual[name]) @
+                                   np.asarray(self.installation.calibration.arms[name].T_flange_from_grasp)).tolist(),
+                    "basis": "first_measured_hold"})
+                monitors[name] = {"reference": reference, "target": np.asarray(target["hold_joints"]),
+                                  "peak_error_rad": 0.}
+        self._update_holds(monitors, actual)
+        return monitors
+
+    def _update_holds(self, monitors: dict, actual: dict) -> None:
+        for name, monitor in monitors.items():
+            error = float(np.max(np.abs(np.asarray(actual[name]["joints_rad"]) - monitor["target"])))
+            monitor["peak_error_rad"] = max(monitor["peak_error_rad"], error)
+
+    def _hold_reports(self, monitors: dict, actual: dict, arrivals: dict) -> dict:
+        reports = {}
+        for name, monitor in monitors.items():
+            data = actual[name]
+            joints = np.asarray(data["joints_rad"])
+            reference = monitor["reference"]
+            pose = self._measured_flange(name, data) @ np.asarray(
+                self.installation.calibration.arms[name].T_flange_from_grasp)
+            position, rotation = distance(np.asarray(reference["grasp_pose"]), pose)
+            cumulative = float(np.max(np.abs(joints - reference["joints_rad"])))
+            verified = arrivals.get(name, {}).get("verified", False)
+            warning = (monitor["peak_error_rad"] > self.tracking_limits.settle_joint_rad
+                       or cumulative > self.tracking_limits.settle_joint_rad
+                       or position > self.tracking_limits.settle_position_m
+                       or rotation > self.tracking_limits.settle_rotation_rad or not verified)
+            reports[name] = {"role": "joint_hold", "reference": reference,
+                "command_joint_target_rad": monitor["target"].tolist(), "actual_joints_rad": joints.tolist(),
+                "threshold_rad": self.tracking_limits.settle_joint_rad,
+                "max_joint_error_rad": monitor["peak_error_rad"],
+                "final_joint_error_rad": float(np.max(np.abs(joints - monitor["target"]))),
+                "cumulative_joint_error_rad": cumulative, "cumulative_position_error_m": position,
+                "cumulative_rotation_error_rad": rotation, "arrival_verified": verified,
+                "feedback_timing": data["timing"], "status": "deviation_warning" if warning else "within_tolerance"}
+        return reports
 
     def _measured_flange(self, name, data):
         native = from_eef(data["flange_position_m"], data["flange_rpy_rad"])
@@ -252,6 +303,8 @@ class ArmBody:
         return result
 
     def invoke(self, device_ids, procedure, params, *, cancel, progress):
+        if procedure == "resume_control":
+            return self._resume_control(device_ids, params, cancel)
         if not self.execute or self.geometry is None or self._blocked.is_set():
             raise DeviceError(ErrorCode.PRECONDITION_FAILED, "Motion is disabled or blocked")
         if procedure != "move_eef_group" or set(device_ids) != set(self._by_device):
@@ -299,9 +352,6 @@ class ArmBody:
                         target["target_position_m"] = goal[:3, 3].tolist()
                         target["target_rpy_rad"] = Rotation.from_matrix(goal[:3, :3]).as_euler("xyz").tolist()
                         travel_limited = True
-                    effective_path = ControlSitePath(start, goal, target.get("control_offset_m", [0., 0., 0.]))
-                    limits = MotionLimits.from_config(self.installation.calibration.arms[n].motion_limits.model_dump())
-                    minimum_duration = max(minimum_duration, effective_path.minimum_duration(limits))
             entry_recovery = None
             try:
                 if self.robot.motion_validation == "command_limits":
@@ -326,38 +376,31 @@ class ArmBody:
                 raise
             checkpoint()
             period = 1 / self.robot.control_frequency_hz
-            durations = []
-            for a, b in zip(path, path[1:]):
-                duration = period
-                for name in a:
-                    limits = MotionLimits.from_config(self.installation.calibration.arms[name].motion_limits.model_dump())
-                    joint_delta = float(np.max(np.abs(b[name] - a[name])))
-                    dp, angle = distance(self.geometry.fk(name, a[name]), self.geometry.fk(name, b[name]))
-                    if joint_delta > limits.joint_step_rad or dp > limits.eef_step_m or angle > limits.eef_rotation_step_rad:
-                        raise DeviceError(ErrorCode.LIMIT_VIOLATION, "Path exceeds station segment limits", stage="preflight")
-                    duration = max(duration, 1.875 * joint_delta / limits.joint_speed_rad_s, limits.eef_duration_s(dp, angle))
-                durations.append(duration)
             gripper_start = {n: (before[n]["agx_gripper"]["width_m"] - self.installation.calibration.arms[n].gripper_closed_m) /
                             (self.installation.calibration.arms[n].gripper_open_m - self.installation.calibration.arms[n].gripper_closed_m)
                             for n in before}
             gripper_duration = max(abs(targets[n]["gripper_opening"] - gripper_start[n]) /
                                    self.installation.calibration.arms[n].motion_limits.gripper_speed_fraction_s for n in before)
-            # Preserve the shared hold/grasp/release duration and bounded gripper slew.
-            scale = max(1., max(gripper_duration, minimum_duration) / sum(durations))
-            durations = [duration * scale for duration in durations]
-            # A time-bounded prefix is a new, fully checked command. Its receipt
-            # requires a fresh observation and new model plan, never automatic replay.
-            available = deadline - time.monotonic() - self.robot.stop_timeout_s
-            count, planned_duration = 0, 0.
-            for duration in durations:
-                if planned_duration + duration > available:
-                    break
-                planned_duration += duration
-                count += 1
-            if count == 0:
-                raise DeviceError(ErrorCode.LIMIT_VIOLATION, "No checked segment fits the action duration before dispatch", stage="preflight")
-            truncated = count < len(durations)
-            path, durations = path[:count + 1], durations[:count]
+            minimum_duration = max(minimum_duration, gripper_duration)
+            # Each candidate curve derives its geometric limits independently.
+            # Only caller/gripper duration requirements survive prefix selection.
+            trajectory = JointTrajectory(path, self.geometry, minimum_duration)
+            available = deadline - time.monotonic() - self.robot.stop_timeout_s - self.tracking_limits.settle_timeout_s
+            truncated = False
+            while trajectory.duration > available:
+                checkpoint()
+                if len(path) <= 2:
+                    raise DeviceError(ErrorCode.LIMIT_VIOLATION,
+                        "No checked prefix fits the action duration before dispatch", stage="preflight")
+                path = path[:max(2, (len(path) + 1) // 2)]
+                trajectory = JointTrajectory(path, self.geometry, minimum_duration)
+                truncated = True
+            if entry_recovery is None:
+                self.geometry.check_trajectory(trajectory, checkpoint=checkpoint)
+            checkpoint()
+            if trajectory.duration > deadline - time.monotonic() - self.robot.stop_timeout_s - self.tracking_limits.settle_timeout_s:
+                raise DeviceError(ErrorCode.LIMIT_VIOLATION,
+                    "Trajectory preflight exhausted the execution budget", stage="preflight")
             with self._dispatch_lock:
                 checkpoint()
                 # Planning can be slow. Do not execute a path from an obsolete start.
@@ -370,7 +413,7 @@ class ArmBody:
                 self.geometry.check({n: current[n]["joints_rad"] for n in measured}, measured=True)
                 submitted = False
                 elapsed = 0.
-                completed_segments = 0
+                completed_ticks = 0
                 residual_prefix = False
                 duration_prefix = False
                 prefix_details = None
@@ -381,86 +424,92 @@ class ArmBody:
                 guards = {n: PoseTrackingGuard(self.tracking_limits,
                     int(data["timing"]["received_monotonic_ns"]) / 1e9, self._tracking_pose(n, data))
                     for n, data in current.items()}
+                actual = current
+                hold_targets = {name: {"hold_joints": path[-1][name]} for name in targets
+                                if "hold_joints" in targets[name]}
+                monitors = self._hold_monitors(hold_targets, current)
+                arrivals = {}
+                last_openings = dict(gripper_start)
                 try:
-                    for index, (row, duration) in enumerate(zip(path[1:], durations), 1):
-                        if cancel.is_set() or self._blocked.is_set():
-                            raise InterruptedError("Robot stop requested")
-
+                    # Near-bound entry admits only the verified legal endpoint.
+                    ticks = 1 if entry_recovery is not None else max(1, math.ceil(trajectory.duration / period))
+                    tick_s = trajectory.duration / ticks
+                    for tick in range(1, ticks + 1):
                         def motion_checkpoint():
                             if cancel.is_set() or self._blocked.is_set() or time.monotonic() >= deadline:
-                                raise InterruptedError("Path interrupted before segment dispatch")
+                                raise InterruptedError("Path interrupted before command dispatch")
 
-                        # Follow the checked joint interval at bounded speed. Each tick
-                        # connects fresh feedback to the next small command, avoiding
-                        # an unnecessary measured-to-distant-waypoint jump.
-                        ticks = 1 if entry_recovery is not None else max(1, math.floor(duration / period))
-                        tick_s = duration / ticks
-                        segment_start = path[index - 1]
-                        for tick in range(1, ticks + 1):
-                            # Include feedback and transport work in the fixed schedule.
-                            end = min(max(path_started_at + elapsed + tick * tick_s, next_command_at),
-                                      deadline - self.robot.stop_timeout_s)
-                            while time.monotonic() < end:
-                                if cancel.wait(min(.005, max(0., end - time.monotonic()))):
-                                    raise InterruptedError("Path interrupted")
-                                motion_checkpoint()
-                                actual = {n: self._require_feedback(n) for n in row}
-                                self.geometry.check({n: data["joints_rad"] for n, data in actual.items()}, measured=True)
-                                self._check_pose_tracking(guards, actual, segment=index)
-                            actual = {n: self._require_feedback(n) for n in row}
+                        end = min(max(path_started_at + tick * tick_s, next_command_at),
+                                  deadline - self.robot.stop_timeout_s)
+                        while time.monotonic() < end:
+                            if cancel.wait(min(.005, max(0., end - time.monotonic()))):
+                                raise InterruptedError("Path interrupted")
+                            motion_checkpoint()
+                            actual = {n: self._require_feedback(n) for n in measured}
                             self.geometry.check({n: data["joints_rad"] for n, data in actual.items()}, measured=True)
-                            self._check_pose_tracking(guards, actual, segment=index)
-                            measured_tick = {n: np.asarray(data["joints_rad"]) for n, data in actual.items()}
-                            fraction = tick / ticks
-                            blend = fraction**3 * (10 + fraction * (-15 + 6 * fraction))
-                            command_row = {n: segment_start[n] + blend * (row[n] - segment_start[n]) for n in row}
-                            if not self.geometry.check_measured_segment(measured_tick, command_row, checkpoint=motion_checkpoint):
-                                prefix_details = {"segment": index, "tick": tick,
-                                                  "connections": self.geometry.command_step_evidence(measured_tick, command_row)}
-                                if not submitted:
-                                    raise DeviceError(ErrorCode.LIMIT_VIOLATION,
-                                        "Measured start exceeds next command step", stage="preflight", details=prefix_details)
-                                residual_prefix = True
-                                break
-                            if time.monotonic() + self.robot.stop_timeout_s >= deadline:
-                                if not submitted:
-                                    raise DeviceError(ErrorCode.LIMIT_VIOLATION,
-                                        "Remaining action time cannot cover stopping", stage="preflight")
-                                duration_prefix = True
-                                break
-                            next_command_at = time.monotonic() + period
-                            for name, q in command_row.items():
-                                motion_checkpoint()
-                                c = self.installation.calibration.arms[name]
-                                gripper_fraction = min(1., (elapsed + fraction * duration) / max(gripper_duration, 1e-9))
-                                command = gripper_start[name] + gripper_fraction * (targets[name]["gripper_opening"] - gripper_start[name])
-                                opening = c.gripper_closed_m + command * (c.gripper_open_m - c.gripper_closed_m)
-                                submitted = True
-                                record = {"arm": name, "segment": index, "tick": tick, "ticks": ticks,
-                                          "sent_realtime_ns": str(time.time_ns()), "target_joints_rad": q.tolist(),
-                                          "opening_m": opening, "measured_start_rad": measured_tick[name].tolist(),
-                                          "send_outcome": "unknown"}
-                                command_trace.append(record)
-                                self._writers[name].move(q, opening, c.gripper_effort)
-                                record["send_outcome"] = "transport_returned"
-                                guards[name].sent(time.monotonic(), self._tracking_target(name, q))
-                            final_sent_at = time.monotonic()
-                            last_target = command_row
-                        if residual_prefix or duration_prefix:
-                            elapsed += (tick - 1) * tick_s
-                            break
-                        progress(index / (len(path) - 1))
-                        elapsed += duration
-                        completed_segments += 1
-                    windows = {n: ArrivalWindow() for n in measured}
-                    while time.monotonic() < deadline:
+                            self._update_holds(monitors, actual)
+                            self._check_pose_tracking(guards, actual, segment=tick)
                         actual = {n: self._require_feedback(n) for n in measured}
                         self.geometry.check({n: data["joints_rad"] for n, data in actual.items()}, measured=True)
-                        self._check_pose_tracking(guards, actual, segment=completed_segments)
+                        self._update_holds(monitors, actual)
+                        self._check_pose_tracking(guards, actual, segment=tick)
+                        measured_tick = {n: np.asarray(data["joints_rad"]) for n, data in actual.items()}
+                        command_row = trajectory.at(tick / ticks)
+                        if not self.geometry.check_measured_segment(measured_tick, command_row, checkpoint=motion_checkpoint):
+                            prefix_details = {"tick": tick,
+                                "connections": self.geometry.command_step_evidence(measured_tick, command_row)}
+                            if not submitted:
+                                raise DeviceError(ErrorCode.LIMIT_VIOLATION,
+                                    "Measured start exceeds next command step", stage="preflight", details=prefix_details)
+                            residual_prefix = True
+                            break
+                        if time.monotonic() + self.robot.stop_timeout_s >= deadline:
+                            if not submitted:
+                                raise DeviceError(ErrorCode.LIMIT_VIOLATION,
+                                    "Remaining action time cannot cover stopping", stage="preflight")
+                            duration_prefix = True
+                            break
+                        next_command_at = time.monotonic() + period
+                        for name, q in command_row.items():
+                            motion_checkpoint()
+                            c = self.installation.calibration.arms[name]
+                            gripper_fraction = min(1., tick * tick_s / max(gripper_duration, 1e-9))
+                            command = gripper_start[name] + gripper_fraction * (targets[name]["gripper_opening"] - gripper_start[name])
+                            opening = c.gripper_closed_m + command * (c.gripper_open_m - c.gripper_closed_m)
+                            record = {"arm": name, "tick": tick, "ticks": ticks,
+                                "sent_realtime_ns": str(time.time_ns()), "target_joints_rad": q.tolist(),
+                                "opening_m": opening, "measured_start_rad": measured_tick[name].tolist(),
+                                "send_outcome": "unknown"}
+                            command_trace.append(record)
+                            submitted = True
+                            if name not in monitors:
+                                self._hold_references.pop(name, None)
+                            self._writers[name].move(q, opening, c.gripper_effort)
+                            record["send_outcome"] = "transport_returned"
+                            last_openings[name] = command
+                            guards[name].sent(time.monotonic(), self._tracking_target(name, q))
+                        final_sent_at = time.monotonic()
+                        last_target = command_row
+                        elapsed = tick * tick_s
+                        completed_ticks = tick
+                        progress(tick / ticks)
+                    windows = {n: ArrivalWindow(duration_s=self.tracking_limits.settle_duration_s,
+                                               max_gap_s=self.tracking_limits.settle_max_gap_s) for n in measured}
+                    arrival_deadline = min(deadline - self.robot.stop_timeout_s,
+                                           time.monotonic() + self.tracking_limits.settle_timeout_s)
+                    while time.monotonic() < arrival_deadline:
+                        actual = {n: self._require_feedback(n) for n in measured}
+                        self.geometry.check({n: data["joints_rad"] for n, data in actual.items()}, measured=True)
+                        self._update_holds(monitors, actual)
+                        self._check_pose_tracking(guards, actual, segment=completed_ticks)
                         arrivals = {}
                         for n, data in actual.items():
                             stamp = int(data["timing"]["received_monotonic_ns"]) / 1e9
-                            within, errors = self._arrival_error(n, data, last_target[n], held="hold_joints" in targets[n])
+                            require_open = targets[n]["gripper_opening"] == 1. and last_openings[n] == 1.
+                            within, errors = self._arrival_error(n, data, last_target[n], held="hold_joints" in targets[n],
+                                require_open=require_open)
+                            errors["gripper_arrival_required"] = require_open
+                            errors["gripper_opening_deferred"] = targets[n]["gripper_opening"] == 1. and not require_open
                             if entry_recovery is not None:
                                 c = self.installation.calibration.arms[n]
                                 within = within and bool(np.all(np.asarray(data["joints_rad"]) >= c.joint_lower)
@@ -471,6 +520,13 @@ class ArmBody:
                                 "feedback_samples": windows[n].samples,
                                 "controller_target_reached": data.get("controller_target_reached")}
                         if all(row["verified"] for row in arrivals.values()):
+                            for name, data in actual.items():
+                                if name not in monitors:
+                                    self._hold_references[name] = {
+                                        "joints_rad": list(data["joints_rad"]),
+                                        "grasp_pose": (self._measured_flange(name, data) @ np.asarray(
+                                            self.installation.calibration.arms[name].T_flange_from_grasp)).tolist(),
+                                        "basis": "last_verified_active_arrival"}
                             return {"requested_targets_reached": not (truncated or duration_prefix or travel_limited or residual_prefix or entry_recovery is not None), "robot_id": self.robot.robot_id,
                                     "prefix_reason": "joint_entry_recovery" if entry_recovery is not None else "measured_start_step" if residual_prefix else
                                         "action_duration" if truncated or duration_prefix else "travel_budget" if travel_limited else None,
@@ -478,26 +534,71 @@ class ArmBody:
                                     "path_reference": "registered_control_site",
                                     "motion_validation": self.robot.motion_validation,
                                     "collision_checked": self.robot.motion_validation == "collision",
-                                    "planned_segments": completed_segments, "planned_duration_s": elapsed,
+                                    "planned_segments": len(trajectory.knots) - 1, "command_ticks": completed_ticks, "planned_duration_s": elapsed,
                                     "arrival": arrivals,
+                                    "hold_reports": self._hold_reports(monitors, actual, arrivals),
                                     "command_trace": command_trace,
                                     "tracking_limits": self.tracking_limits.to_dict(),
                                     "completion_basis": "consecutive_fresh_target_feedback_after_final_command"}
                         if cancel.wait(.01) or self._blocked.is_set():
                             raise InterruptedError("Interrupted during final arrival")
-                    raise TimeoutError("Measured arrival was not verified")
+                    raise DeviceError(ErrorCode.TRACKING_ERROR, "Measured arrival was not verified",
+                        stage="tracking", details={"reason": "arrival_timeout", "arrival": arrivals})
                 except Exception as error:
                     if not submitted and isinstance(error, DeviceError):
                         raise
-                    stop = self._stop_all() if submitted else {"status": "not_dispatched", "physical_stop_guaranteed": False}
+                    sends_known = all(item["send_outcome"] == "transport_returned" for item in command_trace)
+                    recoverable = submitted and isinstance(error, DeviceError) and error.code == ErrorCode.TRACKING_ERROR and sends_known
+                    stop = self._stop_all(recoverable=recoverable) if submitted else {"status": "not_dispatched", "physical_stop_guaranteed": False}
+                    holds_sent = set(stop.get("devices", {})) == set(self._writers) and all(
+                        item.get("hold_command_sent") is True for item in stop["devices"].values())
+                    if (submitted and isinstance(error, DeviceError) and error.code == ErrorCode.TRACKING_ERROR
+                            and holds_sent and sends_known):
+                        raise DeviceError(error.code, str(error), stage="tracking", execution_outcome="partial",
+                            details={**(error.details or {}), "hold_command_sent": True,
+                                     "stop": stop, "command_trace": command_trace,
+                                     "hold_reports": self._hold_reports(monitors, actual, {})}) from error
                     raise DeviceError(ErrorCode.OUTCOME_UNKNOWN if submitted else ErrorCode.PRECONDITION_FAILED,
                         str(error), execution_outcome="unknown" if submitted else "none",
-                        details={"stop": stop, "cause": getattr(error, "details", {}), "command_trace": command_trace},
+                        details={"stop": stop, "cause": getattr(error, "details", {}), "command_trace": command_trace,
+                                 "hold_reports": self._hold_reports(monitors, actual, {})},
                         stage="execution" if submitted else "preflight") from error
 
-    def _stop_all(self):
+    def _resume_control(self, device_ids: list[str], params: dict, cancel: threading.Event) -> dict:
+        if not self.execute or set(device_ids) != set(self._by_device):
+            raise DeviceError(ErrorCode.PRECONDITION_FAILED, "Resume must name every enabled arm", stage="preflight")
+        with self._planning_lock, self._dispatch_lock, self._stop_lock:
+            stop = self._stop_receipt or {}
+            if not self._resume_stop_id or params.get("stop_id") != self._resume_stop_id:
+                raise DeviceError(ErrorCode.PRECONDITION_FAILED, "Tracking stop identity is unavailable or changed", stage="preflight")
+            try:
+                for name, writer in self._writers.items():
+                    if cancel.is_set():
+                        raise RuntimeError("Control recovery cancelled")
+                    data = self._require_feedback(name)
+                    stamp = int(data["timing"]["received_monotonic_ns"])
+                    if data["moving"] is not False or stamp <= int(stop["held_at_monotonic_ns"]):
+                        raise RuntimeError("Fresh stationary feedback after the group hold is required")
+                    writer.resume(lambda name=name: self._require_feedback(name))
+                if cancel.is_set():
+                    raise RuntimeError("Control recovery cancelled")
+            except Exception as error:
+                for writer in self._writers.values():
+                    writer.block()
+                raise DeviceError(ErrorCode.PRECONDITION_FAILED, str(error), stage="preflight") from error
+            self._resume_stop_id = None
+            self._stop_receipt = None
+            self._blocked.clear()
+            return {"resumed": True, "stop_id": stop["stop_id"], "hardware_command_sent": False}
+
+    def _stop_all(self, *, recoverable=False, permanent=False):
         self._blocked.set()
         with self._stop_lock:
+            self._blocked.set()
+            if permanent:
+                self._resume_stop_id = None
+                for writer in self._writers.values():
+                    writer.block()
             if self._stop_receipt is not None:
                 return self._stop_receipt
             def stop(item):
@@ -510,13 +611,16 @@ class ArmBody:
             with ThreadPoolExecutor(max_workers=max(1, len(self._writers))) as pool:
                 evidence = dict(pool.map(stop, self._writers.items()))
             self._stop_receipt = {"robot_id": self.robot.robot_id, "devices": evidence,
+                "stop_id": uuid.uuid4().hex, "held_at_monotonic_ns": str(time.monotonic_ns()),
                 "status": "requested" if evidence else "not_required", "physical_stop_guaranteed": False}
+            if recoverable and evidence and all(item.get("hold_command_sent") is True for item in evidence.values()):
+                self._resume_stop_id = self._stop_receipt["stop_id"]
             return self._stop_receipt
 
     def estop(self, device_id):
         if device_id not in self._by_device:
             raise DeviceError(ErrorCode.UNKNOWN_DEVICE, "Unknown arm")
-        return self._stop_all()
+        return self._stop_all(permanent=True)
 
     def stream_hold(self, device_id):
         if device_id not in self._by_device:

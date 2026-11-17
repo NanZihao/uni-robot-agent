@@ -213,9 +213,16 @@ A failed local solve returns the failed path fraction, position/rotation
 residuals, candidate joints and active bounds. Endpoint-only checks try the last
 verified and measured-start seeds and report their limited search basis.
 
-Execution publishes quintic samples along the checked joint intervals at the
-configured control frequency. Each sample validates the connection from fresh
-measured joints and keeps tracking, stopping and final-arrival verification.
+Execution uses componentwise monotone cubic joint interpolation through the
+checked waypoints and one quintic time base for the complete path. The curve's
+swept joint boxes are preflighted again with the configured tracking uncertainty.
+Analytic derivative bounds enforce joint speed, end-effector speed, rotation
+speed and end-effector acceleration limits. Timing includes the calibrated
+flange and grasp-site offsets. Conservative serial-chain radius bounds can
+extend a path's duration. Collinear waypoint refinement preserves its timing.
+Near-bound entry retains its single verified legal endpoint command.
+Each published sample validates the connection from fresh measured joints and
+keeps tracking, stopping and final-arrival verification.
 Command ticks use a fixed time base, including feedback and transport work in
 each period. Feedback checks continue between command submissions.
 A lagging arm can complete a checked interval through smaller commands. A
@@ -223,6 +230,79 @@ connection that exceeds its bounds ends the acknowledged prefix at the last
 sent target, with `prefix_reason=measured_start_step` and `prefix_details`
 containing the measured/target deltas and limits. Unknown sends retain their
 uncertain outcome and receipt identity.
+
+Tracking deviations and arrival timeouts retain `tracking_error`, the original
+reason and a `partial` outcome when all command sends and all measured-joint
+hold sends return successfully. The environment then verifies terminal receipts,
+fresh stationary feedback and readiness before admitting recovery through the
+shared replanning flow. Failed sends, lost feedback and failed holds retain
+unknown outcomes and operator recovery.
+
+Each evidenced tracking hold has a unique `stop_id`. After the environment
+confirms terminal receipts and fresh stationary feedback, it acquires a new
+lease and invokes the Body's `resume_control` procedure for every arm with that
+identifier. The native adapter validates post-hold feedback, controller mode,
+faults and joint bounds, then reopens both Body and SDK writer admission.
+Recovery changes admission state only. The environment rechecks readiness
+before accepting a new motion. Unknown sends, failed holds and explicit estops
+retain blocked admission. Upgrade environment and Body together to enable this
+procedure. Existing drivers expose their supported native procedures explicitly.
+
+Time-limited paths retain caller and gripper duration requirements while each
+shortened curve recomputes its own geometric duration bounds. A reachable
+prefix can therefore fit the action budget even when the complete path exceeds
+it. Every selected curve receives the same swept-volume preflight and final
+arrival confirmation.
+
+### Native settling and joint holds
+
+`robot.json.tracking_limits` configures native feedback tracking and settling.
+Omitted fields use the defaults below. Existing installations can load their
+current files and receive these defaults. The Body publishes the effective
+values in each arm's `tracking_limits` metadata.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `settle_position_m` | 0.030 | Measured grasp-site position error |
+| `settle_rotation_rad` | 0.20 | Measured grasp-site rotation error |
+| `settle_joint_rad` | 0.10 | Held-joint error and hold-report threshold |
+| `settle_gripper_opening` | 0.05 | Normalized error for a fully open gripper |
+| `settle_duration_s` | 0.05 | Continuous in-tolerance confirmation interval |
+| `settle_max_gap_s` | 0.04 | Maximum gap between confirmation samples |
+| `settle_timeout_s` | 0.60 | Maximum final-arrival wait |
+
+Settle position and rotation tolerances must fit within the corresponding
+tracking limits. Confirmation requires at least three distinct fresh samples
+after the final command, with the arm stationary. Execution reserves the settle
+timeout and stop allowance before dispatch. Tool-side `standard`, `approach`
+and `precision` profiles continue to judge the final measured target error.
+Native settling now uses its independent configuration in both validation
+profiles. Collision-mode installations that used the strictest motion profile
+for native completion should explicitly set their desired settle tolerances.
+
+A fully open target waits for measured calibrated opening within tolerance
+through the same confirmation interval. Closing and intermediate targets retain
+tool-side opening feedback. A truncated path that has only submitted an
+intermediate opening reports `gripper_opening_deferred=true` and completes its
+verified prefix with that submitted command.
+
+`hold_reports` records each held arm's peak and final joint error, cumulative
+joint/position/rotation drift, arrival verification and feedback timing. A
+reference begins with the first measured hold and persists across hold calls.
+A verified active Cartesian arrival establishes a new reference. Rejected
+preflights preserve the previous reference. References live for the Body's
+lifetime. Drift exceeding a settle threshold produces `deviation_warning` in
+the report. Native tracking, collision, freshness and stopping checks continue
+throughout the operation. Interrupted operations retain their hold evidence in
+receipts and shared gripper feedback.
+
+SocketCAN feedback uses kernel RX timestamps converted to the host monotonic
+clock. Buffered frames retain their original age. Pending receive backlog and
+invalid timestamps fail freshness checks. Diagnostics retain receive delay and
+socket-drop counts. Observation timestamps use the oldest contributing fragment
+and publish `source_semantics=host_can_kernel_receive`. Upgrade the environment
+and Body together for this timing contract. Existing recorded
+`host_can_receive` and `controller_status_publication` histories remain readable.
 
 Environment diagnostics expose `planning_errors`, `prefix_reason` and
 `prefix_details` in the shared tools' `feedback.stop_evidence`. These additive

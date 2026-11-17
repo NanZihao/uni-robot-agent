@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Complete Piper-X tracking-stop recovery through an identified native resume
+  operation under a new lease, preserving unknown-outcome quarantine and estop
+  latches. Recompute shortened-path timing from each checked prefix while
+  retaining caller and gripper duration requirements.
+
+- Add Piper-X held-arm peak/cumulative drift reports, independent configurable
+  native settling and measured full-open confirmation. Legacy installation
+  files receive the documented settle defaults. Collision-mode native arrival
+  now uses `tracking_limits` independently of tool motion profiles.
+
+- Preserve evidenced Piper-X tracking interruptions for the shared recovery
+  flow, timestamp CAN feedback at kernel receipt and reject pending backlogs.
+  Use preflighted monotone joint curves with one bounded whole-path time base.
+  Upgrade Piper-X environment and Body runtimes together for kernel-RX history.
+
 - Improve Piper-X registered-grasp-site interpolation, bounded analytic-Jacobian
   IK with a 2 mm optimized position tolerance, and adaptive path sampling. Stream
   checked joint intervals with quintic commands and measured per-tick admission.

@@ -17,7 +17,6 @@ from scipy.spatial.transform import Rotation
 
 from uni_robot_agent.services.environment.contracts import Contract, FiniteFloat
 from uni_robot_agent.integrations.piper_x.body.core.contract import DeviceError, ErrorCode
-from uni_robot_agent.integrations.piper_x.body.core.arm.tracking import TrackingLimits
 from uni_robot_agent.integrations.piper_x.environment.kinematics import from_eef, distance
 from ..config import FileRef
 from .path import ControlSitePath
@@ -76,7 +75,7 @@ def segment_distance(a, b, c, d):
 class RobotGeometry:
     def __init__(self, installation):
         self.installation = installation
-        self.tracking_limits = TrackingLimits()
+        self.tracking_limits = installation.robot.tracking_limits
         self.model = installation.model
         self.collision_enabled = installation.robot.motion_validation == "collision"
         if not self.collision_enabled and not installation.calibration.operator_supervised:
@@ -372,6 +371,27 @@ class RobotGeometry:
                         6 * self.installation.calibration.arms[n].tracking_tolerance_rad)) for n in start}
             self.check(row, inflation)
         return True
+
+    def check_trajectory(self, trajectory, *, checkpoint):
+        """Enclose each monotone cubic interval, including tracking uncertainty."""
+        for left, right in zip(trajectory.knots, trajectory.knots[1:]):
+            start, end = trajectory.at_parameter(left), trajectory.at_parameter(right)
+            steps = self._subdivisions(start, end)
+            if steps > 2000:
+                raise DeviceError(ErrorCode.LIMIT_VIOLATION, "Trajectory subdivision budget exceeded", stage="preflight")
+            previous = start
+            for parameter in np.linspace(left, right, steps + 1)[1:]:
+                checkpoint()
+                row = trajectory.at_parameter(parameter)
+                inflation = {}
+                for name in row:
+                    delta = np.abs(row[name] - previous[name])
+                    tracking = self.installation.calibration.arms[name].tracking_tolerance_rad
+                    inflation[name] = delta + tracking if self.mesh_checks is not None else self.reach * (delta.sum() + 6*tracking)
+                # PCHIP is componentwise monotone within each original interval.
+                # This joint box encloses the entire curve between the samples.
+                self.check(row, inflation)
+                previous = row
 
     def entry_recovery(self, measured):
         """Return one bounded entry destination, never the original task goal."""

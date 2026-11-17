@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 import math
 
 from .eef import pose_error
@@ -23,11 +23,33 @@ class TrackingLimits:
     settle_joint_rad: float = .1
     hold_admission_joint_rad: float = .1
     preflight_joint_rad: float = .1
+    settle_position_m: float = .030
+    settle_rotation_rad: float = .20
+    settle_gripper_opening: float = .05
+    settle_duration_s: float = .05
+    settle_max_gap_s: float = .04
+    settle_timeout_s: float = .6
 
     def __post_init__(self) -> None:
         if any(isinstance(v, bool) or not math.isfinite(v) or v <= 0
                for v in asdict(self).values()):
             raise ValueError("Tracking limits must be finite positive numbers")
+        if self.settle_position_m > self.position_m or self.settle_rotation_rad > self.rotation_rad:
+            raise ValueError("Settle tolerances must fit inside tracking tolerances")
+        if self.settle_gripper_opening >= 1:
+            raise ValueError("Gripper settle tolerance must be below one")
+        if self.settle_duration_s >= self.settle_timeout_s:
+            raise ValueError("Arrival confirmation must fit inside settle_timeout_s")
+
+    @classmethod
+    def from_config(cls, value: dict | TrackingLimits) -> TrackingLimits:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict) or set(value) - {f.name for f in fields(cls)}:
+            raise ValueError("Unknown or invalid tracking_limits fields")
+        if any(type(v) not in (int, float) for v in value.values()):
+            raise ValueError("Tracking limits require numeric values")
+        return cls(**value)
 
     def to_dict(self) -> dict[str, float]:
         return asdict(self)

@@ -44,7 +44,7 @@ def joint_state_at_time(
             or timing.get("source_clock") != "unix_realtime"
         ):
             raise ValueError("image and joint history use different host clocks")
-        if timing.get("source_semantics") not in {"controller_status_publication", "host_can_receive"}:
+        if timing.get("source_semantics") not in {"controller_status_publication", "host_can_receive", "host_can_kernel_receive"}:
             raise ValueError("joint history does not contain controller source times")
         stamp = timestamp_ns(timing.get("source_timestamp_ns"))
         received = timestamp_ns(timing.get("received_realtime_ns"))

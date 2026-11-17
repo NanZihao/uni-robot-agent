@@ -36,6 +36,7 @@ def verify(client, config, *, arm_names=None, verify_readiness=True):
             raise ValueError(f"Body {name} controller model differs from the configured URDF")
         limits[name] = {key: metadata["motion_limits"][key] for key in contract.MOTION_LIMITS}
         limits[name]["group_path"] = contract.supports_group_path(device)
+        limits[name]["resume_control"] = "resume_control" in device.get("procedures", {})
         if limits[name]["group_path"]:
             maximum = device["procedures"][contract.GROUP_PATH].get("params", {}).get("max_segments", {}).get("maximum", 24)
             if type(maximum) is not int or maximum < 1:

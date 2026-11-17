@@ -32,6 +32,14 @@ OPERATOR_RECOVERY = ("Movement stays blocked until an operator checks the robot 
                      "environment service. capture_scene and finish remain available.")
 
 
+def _operation_hold_reports(operations: dict) -> dict:
+    reports = {}
+    for operation in operations.values():
+        payload = operation.get("result") or (operation.get("error") or {}).get("details") or {}
+        reports.update(payload.get("hold_reports") or {})
+    return reports
+
+
 def _pose_rpy(t):
     """World [x,y,z,roll,pitch,yaw], the form a move target uses."""
     rpy = Rotation.from_matrix(t[:3, :3]).as_euler("xyz")
@@ -54,6 +62,7 @@ class Adapter:
         self._resume = None
         self._blocked = None
         self._recovery_count = 0
+        self._native_resume_stop_id: str | None = None
         self._recovery_lock = threading.RLock()
         try:
             self.camera_client = camera_client or BodyClient(config.cameras_body, timeout_s=config.rpc_timeout_s)
@@ -151,13 +160,22 @@ class Adapter:
                 # Fresh post-stop samples, no owner, no active work, and the pinned
                 # identity plus device readiness.
                 confirm_unowned_idle(self.config, self.client)
-                self.limits = verify(self.client, self.config)
+                self.limits = verify(self.client, self.config, verify_readiness=self._native_resume_stop_id is None)
                 self._fresh_state()
                 previous.close()
                 self._recovery_count += 1
                 self.control = self._new_control(f"body-journal-recovery-{self._recovery_count}.jsonl")
                 self.control.record("recovery_requested", recovery_reason=reason)
                 self.control.acquire()
+                if self._native_resume_stop_id is not None:
+                    operation = self.control.invoke_group([a.device_id for a in self.config.arms.values()],
+                        "resume_control", {"stop_id": self._native_resume_stop_id})
+                    results = self.control.wait_operations([operation])
+                    result = results[operation].get("result") or {}
+                    if result.get("resumed") is not True or result.get("stop_id") != self._native_resume_stop_id:
+                        raise BodyError("native_resume_unverified")
+                    self._native_resume_stop_id = None
+                    self.limits = verify(self.client, self.config)
                 self.control.record("recovery_ready", replayed_operations=False)
             except Exception as error:
                 self._blocked = {"reason": f"recovery_failed: {type(error).__name__}", "stop": previous.evidence}
@@ -239,7 +257,7 @@ class Adapter:
             source_ns = timestamp_ns(timing.get("source_timestamp_ns"))
             now_ns = time.time_ns()
             if (timing.get("clock_id") != host_clock_id() or timing.get("source_clock") != "unix_realtime"
-                    or timing.get("source_semantics") not in {"controller_status_publication", "host_can_receive"}
+                    or timing.get("source_semantics") not in {"controller_status_publication", "host_can_receive", "host_can_kernel_receive"}
                     or source_ns > now_ns + 1_000_000 or now_ns - source_ns > self.config.max_age_s * 1e9
                     or (after_ns is not None and source_ns <= after_ns)):
                 raise RuntimeError("Arm feedback source time is stale or uses a different clock")
@@ -306,7 +324,10 @@ class Adapter:
         state = self.read_state()
         if state.metadata.get("feedback_fresh"):
             self._measured_commands(state)
+        hold_reports = _operation_hold_reports(evidence.get("operations", {}))
+        hold_reports.update(((evidence.get("native_error") or {}).get("details") or {}).get("hold_reports") or {})
         diagnostics = {"reason": reason, "message": f"{message} {OPERATOR_RECOVERY}",
+                       "hold_reports": hold_reports,
                        "stop": self.control.evidence, **evidence}
         self.control.record("blocked_receipt", execution_outcome=execution_outcome, **diagnostics)
         return StepReceipt(accepted=False, state=state, diagnostics=diagnostics, execution_outcome=execution_outcome,
@@ -358,6 +379,7 @@ class Adapter:
                     execution_outcome=outcome, operations=operations)
             self._measured_commands(state)
             diagnostics = {"reason": "tracking_interrupted",
+                "hold_reports": _operation_hold_reports(operations),
                 "message": f"The arm stopped before the waypoint ({', '.join(reasons)}); the group is confirmed "
                            "idle. The next command takes control again; this one is not replayed.",
                 "tracking_reasons": reasons, "stop": stop, "operations": operations}
@@ -377,7 +399,16 @@ class Adapter:
                 return "incomplete_group_report"
         try:
             confirm_unowned_idle(self.config, self.client)
-            verify(self.client, self.config)
+            limits = verify(self.client, self.config, verify_readiness=False)
+            native_resume = [item["resume_control"] for item in limits.values()]
+            if any(native_resume):
+                stop_ids = {((op.get("error") or {}).get("details") or {}).get("stop", {}).get("stop_id")
+                            for op in failures}
+                if not all(native_resume) or len(stop_ids) != 1 or None in stop_ids:
+                    return "native_resume_evidence_incomplete"
+                self._native_resume_stop_id = stop_ids.pop()
+            else:
+                verify(self.client, self.config)
         except Exception as error:
             return f"recovery_preflight_failed: {type(error).__name__}"
         return None
