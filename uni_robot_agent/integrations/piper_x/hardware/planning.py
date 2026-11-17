@@ -1,4 +1,4 @@
-"""Deterministic all-arm IK with an explicit installation validation profile.
+"""Deterministic all-arm IK and conservative capsule swept-volume preflight.
 
 Capsules must be commissioned enclosing geometry, including the gripper at its
 maximum opening. They are hash-pinned model assets, not inferred from URDF names.
@@ -12,16 +12,19 @@ from typing import Callable, Literal
 
 import numpy as np
 from pydantic import Field
+from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
 
 from uni_robot_agent.services.environment.contracts import Contract, FiniteFloat
 from uni_robot_agent.integrations.piper_x.body.core.contract import DeviceError, ErrorCode
 from uni_robot_agent.integrations.piper_x.body.core.arm.tracking import TrackingLimits
-from uni_robot_agent.integrations.piper_x.environment.kinematics import from_eef, bounded_target, distance
+from uni_robot_agent.integrations.piper_x.environment.kinematics import from_eef, distance
 from ..config import FileRef
+from .path import ControlSitePath
 
-# Measured near-bound feedback may enter the native command interval. These
-# never expand transmitted joint limits or permit continued out-of-range goals.
+IK_REFINE_JOINT_RAD = .15
+MAX_REFINEMENT_DEPTH = 5
+MAX_PREFLIGHT_SAMPLES = 512
 ENTRY_FEEDBACK_TOLERANCE_RAD = .02
 ENTRY_COMMAND_MARGIN_RAD = .03
 
@@ -107,6 +110,28 @@ class RobotGeometry:
                 if (limit is None or self.model.joint_lower[index] < float(limit.get("lower"))
                         or self.model.joint_upper[index] > float(limit.get("upper"))):
                     raise ValueError("Model limits exceed the pinned URDF limits")
+        self._origins = {j.get("name"): self._origin(j) for j in self.joints}
+        self._axes = {}
+        for joint in self.joints:
+            if joint.get("type") == "fixed":
+                continue
+            axis = joint.find("axis")
+            direction = np.array([float(v) for v in ("1 0 0" if axis is None else axis.get("xyz")).split()])
+            if direction.shape != (3,) or np.linalg.norm(direction) < 1e-12:
+                raise ValueError("Invalid URDF axis")
+            self._axes[joint.get("name")] = direction / np.linalg.norm(direction)
+        by_child = {j.find("child").get("link"): j for j in self.joints}
+        self._chain = []
+        link = self.model.tip_link
+        while link != self.model.root_link:
+            if link not in by_child or by_child[link] in self._chain:
+                raise ValueError("Disconnected or cyclic URDF")
+            joint = by_child[link]
+            self._chain.append(joint)
+            link = joint.find("parent").get("link")
+        self._chain.reverse()
+        if [j.get("name") for j in self._chain if j.get("type") != "fixed"] != self.model.joint_names:
+            raise ValueError("URDF chain differs from controller joint order")
         # Bounds displacement of any enclosed point per radian for every joint.
         extent = (max(max(np.linalg.norm(c.start), np.linalg.norm(c.end)) + c.radius_m
                       for c in self.collision.capsules) if self.collision else
@@ -139,7 +164,7 @@ class RobotGeometry:
                 parent, child = joint.find("parent").get("link"), joint.find("child").get("link")
                 if parent not in frames:
                     continue
-                t = frames[parent] @ self._origin(joint)
+                t = frames[parent] @ self._origins[joint.get("name")]
                 if joint.get("type") != "fixed":
                     if joint.get("name") not in values:
                         raise ValueError("URDF has an unmodelled movable joint")
@@ -157,25 +182,78 @@ class RobotGeometry:
                 raise ValueError("Disconnected or cyclic URDF")
         return frames
 
+    def fk_jacobian(self, name, q):
+        """Cached serial-chain FK and spatial geometric Jacobian in arm-base axes."""
+        q = np.asarray(q, dtype=float)
+        if q.shape != (6,) or not np.isfinite(q).all():
+            raise ValueError("Expected six finite joint angles")
+        calibration = self.installation.calibration.arms[name]
+        values = q + calibration.kinematic_joint_offsets_rad
+        frame = np.asarray(calibration.T_base_from_urdf).copy()
+        axes, origins = [], []
+        for joint in self._chain:
+            frame = frame @ self._origins[joint.get("name")]
+            if joint.get("type") != "fixed":
+                axis = self._axes[joint.get("name")]
+                origins.append(frame[:3, 3].copy())
+                axes.append(frame[:3, :3] @ axis)
+                turn = np.eye(4)
+                turn[:3, :3] = Rotation.from_rotvec(axis * values[len(axes) - 1]).as_matrix()
+                frame = frame @ turn
+        frame = frame @ np.asarray(calibration.T_tip_from_flange)
+        jacobian = np.vstack((np.cross(np.array(axes), frame[:3, 3] - origins).T, np.array(axes).T))
+        return frame, jacobian
+
     def fk(self, name, q):
-        return self.links_at(name, q)[self.model.tip_link] @ np.asarray(self.installation.calibration.arms[name].T_tip_from_flange)
+        return self.fk_jacobian(name, q)[0]
+
+    @staticmethod
+    def _rotation_error_jacobian(vector):
+        """SO(3) right-Jacobian inverse for target * current.transpose()."""
+        x, y, z = vector
+        skew = np.array([[0., -z, y], [z, 0., -x], [-y, x, 0.]])
+        angle = np.linalg.norm(vector)
+        coefficient = (1 / 12 + angle**2 / 720 if angle < 1e-4 else
+                       (1 - .5 * angle / math.tan(.5 * angle)) / angle**2)
+        return np.eye(3) + .5 * skew + coefficient * skew @ skew
 
     def ik(self, name, target, initial, *, checkpoint: Callable[[], None] | None = None):
-        c = self.installation.calibration.arms[name]
-        q = np.asarray(initial, dtype=float).copy()
-        def error(q):
-            t = self.fk(name, q)
-            return np.r_[target[:3, 3] - t[:3, 3], Rotation.from_matrix(target[:3, :3] @ t[:3, :3].T).as_rotvec() * .15]
-        for _ in range(120):
+        calibration = self.installation.calibration.arms[name]
+        lower, upper = np.asarray(calibration.joint_lower), np.asarray(calibration.joint_upper)
+        initial = np.asarray(initial, dtype=float)
+        if initial.shape != (6,) or not np.isfinite(initial).all() or not np.isfinite(target).all():
+            raise DeviceError(ErrorCode.INVALID_ARGUMENTS, "IK requires finite joints and target", stage="preflight")
+
+        def evaluate(q):
             if checkpoint is not None:
                 checkpoint()
-            e = error(q)
-            if np.linalg.norm(e[:3]) <= .001 and np.linalg.norm(e[3:]) <= .003:
-                return q
-            j = np.column_stack([(error(q + np.eye(6)[i] * 1e-5) - e) / 1e-5 for i in range(6)])
-            dq = -j.T @ np.linalg.solve(j @ j.T + np.eye(6) * 1e-5, e)
-            q = np.clip(q + np.clip(dq, -.1, .1), c.joint_lower, c.joint_upper)
-        raise DeviceError(ErrorCode.LIMIT_VIOLATION, f"{name}: IK failed before dispatch", stage="preflight")
+            actual, jacobian = self.fk_jacobian(name, q)
+            rotation = Rotation.from_matrix(target[:3, :3] @ actual[:3, :3].T).as_rotvec()
+            residual = np.r_[target[:3, 3] - actual[:3, 3], rotation * .15]
+            derivative = np.vstack((-jacobian[:3], -.15 * self._rotation_error_jacobian(rotation) @ jacobian[3:]))
+            return residual, derivative
+
+        seed = np.clip(initial, lower, upper)
+        residual, _ = evaluate(seed)
+        if np.linalg.norm(residual[:3]) <= .001 and np.linalg.norm(residual[3:]) <= .003:
+            return seed
+        solution = least_squares(lambda q: evaluate(q)[0], seed, jac=lambda q: evaluate(q)[1],
+                                 bounds=(lower, upper), max_nfev=120, ftol=1e-9, xtol=1e-9, gtol=1e-9)
+        residual, _ = evaluate(solution.x)
+        position, rotation = float(np.linalg.norm(residual[:3])), float(np.linalg.norm(residual[3:]) / .15)
+        # Keep the 1 mm seed fast path; allow up to 2 mm after bounded optimization.
+        if position <= .002 + 1e-12 and rotation <= .02:
+            return solution.x
+        margins = np.minimum(solution.x - lower, upper - solution.x)
+        raise DeviceError(ErrorCode.LIMIT_VIOLATION, f"{name}: IK failed before dispatch", stage="preflight",
+                          details={"reason": "ik_no_verified_solution", "arm": name, "solver": "bounded_trust_region",
+                                   "position_residual_m": position, "rotation_residual_rad": rotation,
+                                   "position_tolerance_m": .002, "rotation_tolerance_rad": .02,
+                                   "evaluations": solution.nfev, "solver_status": int(solution.status),
+                                   "candidate_joints_rad": solution.x.tolist(), "joint_margins_rad": margins.tolist(),
+                                   "active_joint_limits": [dict(joint_index=i, lower=float(lower[i]), upper=float(upper[i]),
+                                                                value=float(solution.x[i]))
+                                                           for i in range(6) if margins[i] < 1e-5]})
 
     def check(self, positions, inflation=None, *, measured=False):
         capsules = []
@@ -212,33 +290,21 @@ class RobotGeometry:
             if segment_distance(a[2], a[3], b[2], b[3]) <= a[4] + b[4] + cal.collision_margin_m:
                 raise DeviceError(ErrorCode.LIMIT_VIOLATION, "Self or inter-arm collision clearance failed", stage="preflight")
 
-    def entry_recovery(self, measured):
-        """Return one bounded entry destination, never the original task goal."""
-        if self.collision_enabled:
-            return None
-        self.check(measured, measured=True)
-        start = {name: np.asarray(q, dtype=float) for name, q in measured.items()}
-        goal = {name: q.copy() for name, q in start.items()}
-        changed = False
-        for name, q in start.items():
-            calibration = self.installation.calibration.arms[name]
-            lower, upper = np.asarray(calibration.joint_lower), np.asarray(calibration.joint_upper)
-            margin = np.minimum(ENTRY_COMMAND_MARGIN_RAD, (upper - lower) / 4)
-            below, above = q < lower, q > upper
-            if not np.any(below | above):
+    def goal_check(self, name, target, seeds, *, checkpoint=None):
+        """Endpoint evidence for supplied local seeds; path admission stays separate."""
+        attempts = []
+        for label, seed in seeds:
+            try:
+                joints = self.ik(name, target, seed, checkpoint=checkpoint)
+            except DeviceError as error:
+                if (error.details or {}).get("reason") != "ik_no_verified_solution":
+                    raise
+                attempts.append({"seed": label, **error.details})
                 continue
-            # An exact-bound peer joint can drift outside while this arm enters.
-            # Give its command the same margin without moving an unaffected arm.
-            near_lower, near_upper = q < lower + margin, q > upper - margin
-            goal[name][near_lower] = (lower + margin)[near_lower]
-            goal[name][near_upper] = (upper - margin)[near_upper]
-            changed = True
-        if not changed:
-            return None
-        self.check(goal)
-        if not self._within_command_step(start, goal):
-            raise DeviceError(ErrorCode.LIMIT_VIOLATION, "Joint entry exceeds command step limits", stage="preflight")
-        return goal
+            return {"status": "verified_endpoint", "seed": label, "joints_rad": joints.tolist(),
+                    "path_checked": False, "ik_branches": "supplied_local_seeds"}
+        return {"status": "no_verified_solution", "attempts": attempts,
+                "path_checked": False, "ik_branches": "supplied_local_seeds"}
 
     def _within_command_step(self, start, end):
         for name in start:
@@ -249,6 +315,19 @@ class RobotGeometry:
             if dp > limits.eef_step_m or angle > limits.eef_rotation_step_rad:
                 return False
         return True
+
+    def command_step_evidence(self, start, end):
+        evidence = {}
+        for name in start:
+            limits = self.installation.calibration.arms[name].motion_limits
+            position, angle = distance(self.fk(name, start[name]), self.fk(name, end[name]))
+            evidence[name] = {"measured_joints_rad": np.asarray(start[name]).tolist(),
+                              "target_joints_rad": np.asarray(end[name]).tolist(),
+                              "max_joint_delta_rad": float(np.max(np.abs(end[name] - start[name]))),
+                              "joint_delta_limit_rad": limits.joint_step_rad,
+                              "position_delta_m": position, "position_limit_m": limits.eef_step_m,
+                              "rotation_delta_rad": angle, "rotation_limit_rad": limits.eef_rotation_step_rad}
+        return evidence
 
     def _subdivisions(self, start, end):
         if self.collision_enabled:
@@ -294,6 +373,34 @@ class RobotGeometry:
             self.check(row, inflation)
         return True
 
+    def entry_recovery(self, measured):
+        """Return one bounded entry destination, never the original task goal."""
+        if self.collision_enabled:
+            return None
+        self.check(measured, measured=True)
+        start = {name: np.asarray(q, dtype=float) for name, q in measured.items()}
+        goal = {name: q.copy() for name, q in start.items()}
+        changed = False
+        for name, q in start.items():
+            calibration = self.installation.calibration.arms[name]
+            lower, upper = np.asarray(calibration.joint_lower), np.asarray(calibration.joint_upper)
+            margin = np.minimum(ENTRY_COMMAND_MARGIN_RAD, (upper - lower) / 4)
+            below, above = q < lower, q > upper
+            if not np.any(below | above):
+                continue
+            # An exact-bound peer joint can drift outside while this arm enters.
+            # Give its command the same margin without moving an unaffected arm.
+            near_lower, near_upper = q < lower + margin, q > upper - margin
+            goal[name][near_lower] = (lower + margin)[near_lower]
+            goal[name][near_upper] = (upper - margin)[near_upper]
+            changed = True
+        if not changed:
+            return None
+        self.check(goal)
+        if not self._within_command_step(start, goal):
+            raise DeviceError(ErrorCode.LIMIT_VIOLATION, "Joint entry exceeds command step limits", stage="preflight")
+        return goal
+
     def plan(self, measured, targets, *, segment_m, max_segments,
              checkpoint: Callable[[], None] | None = None):
         """Check the complete joint path, including non-participating measured holds."""
@@ -301,7 +408,7 @@ class RobotGeometry:
             raise DeviceError(ErrorCode.INVALID_ARGUMENTS, "A path must name every arm")
         current = {n: np.array(q, dtype=float) for n, q in measured.items()}
         starts = {n: self.fk(n, q) for n, q in current.items()}
-        goals, segments = {}, 1
+        goals, site_paths, segments = {}, {}, 1
         for name, target in targets.items():
             if "hold_joints" in target:
                 tolerance = self.tracking_limits.hold_admission_joint_rad
@@ -310,27 +417,50 @@ class RobotGeometry:
                 goals[name] = starts[name]
             else:
                 goals[name] = from_eef(target["target_position_m"], target["target_rpy_rad"])
-                dp, angle = distance(starts[name], goals[name])
+                site_paths[name] = ControlSitePath(starts[name], goals[name], target.get("control_offset_m", [0., 0., 0.]))
                 radius = self.installation.calibration.arms[name].rotation_radius_m
-                segments = max(segments, math.ceil((dp + radius * angle) / segment_m))
+                segments = max(segments, math.ceil(site_paths[name].work(radius) / segment_m))
         if segments > max_segments:
             raise DeviceError(ErrorCode.LIMIT_VIOLATION, "Path exceeds the requested travel budget")
         if checkpoint is not None:
             checkpoint()
         self.check(current)
         path = [current]
-        for index in range(1, segments + 1):
+        samples = 0
+
+        def solve_interval(previous_fraction, fraction, depth=0):
+            nonlocal current, samples
             if checkpoint is not None:
                 checkpoint()
+            samples += 1
+            if samples > MAX_PREFLIGHT_SAMPLES:
+                raise DeviceError(ErrorCode.LIMIT_VIOLATION, "Path refinement budget exceeded", stage="preflight")
             next_q = {}
-            for name in current:
-                if "hold_joints" in targets[name]:
-                    next_q[name] = current[name].copy()
-                else:
-                    dp, angle = distance(starts[name], goals[name])
-                    waypoint = bounded_target(starts[name], goals[name], translation=max(dp, 1e-12) * index / segments,
-                                              rotation=max(angle, 1e-12) * index / segments)
-                    next_q[name] = self.ik(name, waypoint, current[name], checkpoint=checkpoint)
+            try:
+                for name in current:
+                    if name in site_paths:
+                        next_q[name] = self.ik(name, site_paths[name].at(fraction), current[name], checkpoint=checkpoint)
+                    else:
+                        next_q[name] = current[name].copy()
+            except DeviceError as error:
+                error.details = {**(error.details or {}), "path_fraction": fraction,
+                                 "previous_path_fraction": previous_fraction, "refinement_depth": depth}
+                if error.details.get("reason") == "ik_no_verified_solution" and depth < MAX_REFINEMENT_DEPTH:
+                    middle = (previous_fraction + fraction) / 2
+                    solve_interval(previous_fraction, middle, depth + 1)
+                    solve_interval(middle, fraction, depth + 1)
+                    return
+                raise
+            largest_jump = max(float(np.max(np.abs(next_q[n] - current[n]))) for n in current)
+            if largest_jump > IK_REFINE_JOINT_RAD:
+                if depth >= MAX_REFINEMENT_DEPTH:
+                    raise DeviceError(ErrorCode.LIMIT_VIOLATION, "IK path continuity could not be verified", stage="preflight",
+                                      details={"reason": "ik_branch_discontinuity", "path_fraction": fraction,
+                                               "max_joint_delta_rad": largest_jump, "refinement_depth": depth})
+                middle = (previous_fraction + fraction) / 2
+                solve_interval(previous_fraction, middle, depth + 1)
+                solve_interval(middle, fraction, depth + 1)
+                return
             # Cover each joint interpolation interval with inflated endpoint capsules.
             # The reach bound covers all joints, making this conservative between samples.
             steps = self._subdivisions(current, next_q)
@@ -359,4 +489,14 @@ class RobotGeometry:
                 previous = row
             path.append(next_q)
             current = next_q
+
+        try:
+            for index in range(1, segments + 1):
+                solve_interval((index - 1) / segments, index / segments)
+        except DeviceError as error:
+            name = (error.details or {}).get("arm")
+            if name in site_paths:
+                error.details["goal_joint_check"] = self.goal_check(name, goals[name],
+                    [("last_verified", current[name]), ("measured_start", measured[name])], checkpoint=checkpoint)
+            raise
         return path

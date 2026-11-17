@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
+import math
 import threading
 import time
 
@@ -20,8 +21,9 @@ from uni_robot_agent.integrations.piper_x.body.core.resources import ResourceLoc
 from ..config import Installation
 from .identity import verify_can
 from .planning import RobotGeometry
+from .path import ControlSitePath
 from .transport import PassiveCan, SdkWriter
-from uni_robot_agent.integrations.piper_x.environment.kinematics import Kinematics, distance, from_eef, bounded_target
+from uni_robot_agent.integrations.piper_x.environment.kinematics import Kinematics, distance, from_eef
 
 
 class ArmBody:
@@ -122,10 +124,10 @@ class ArmBody:
                     "joint_limits_rad": {"lower": c.joint_lower, "upper": c.joint_upper},
                     "motion_limits": c.motion_limits.model_dump(), "eef_coordinates": coordinate_metadata(arm.device_id),
                     "tracking_limits": self.tracking_limits.to_dict(),
-                    "motion_validation": self.robot.motion_validation,
-                    "collision_checking_enabled": self.robot.motion_validation == "collision",
                     "kinematic_joint_offsets_rad": c.kinematic_joint_offsets_rad,
                     "eef_pose_source": "native feedback with calibrated kinematic correction" if any(c.kinematic_joint_offsets_rad) else "native feedback",
+                    "motion_validation": self.robot.motion_validation,
+                    "collision_checking_enabled": self.robot.motion_validation == "collision",
                     "model_sha256": self.installation.model.urdf.sha256, "motion_enabled": self.execute},
                 limitations=["Host CAN receive timestamps; no controller hardware clock", "Software stop is not a certified E-stop",
                     *(["Command-limit validation only; no table, self or inter-arm collision checks"]
@@ -283,17 +285,23 @@ class ArmBody:
                 if type(opening) not in (float, int) or not np.isfinite(opening) or not 0 <= opening <= 1:
                     raise DeviceError(ErrorCode.INVALID_ARGUMENTS, "Expected normalized gripper target")
                 if "hold_joints" not in target:
+                    offset = np.asarray(target.get("control_offset_m", [0., 0., 0.]), dtype=float)
+                    if offset.shape != (3,) or not np.isfinite(offset).all():
+                        raise DeviceError(ErrorCode.INVALID_ARGUMENTS, "Expected three finite control-offset values", stage="preflight")
                     start = self.geometry.fk(n, measured[n])
                     goal = from_eef(target["target_position_m"], target["target_rpy_rad"])
-                    dp, angle = distance(start, goal)
-                    travel = dp + self.installation.calibration.arms[n].rotation_radius_m * angle
+                    site_path = ControlSitePath(start, goal, target.get("control_offset_m", [0., 0., 0.]))
+                    travel = site_path.work(self.installation.calibration.arms[n].rotation_radius_m)
                     budget = params["segment_m"] * params["max_segments"]
                     if travel > budget:
                         fraction = budget * .999 / travel
-                        goal = bounded_target(start, goal, translation=dp * fraction, rotation=angle * fraction)
+                        goal = site_path.at(fraction)
                         target["target_position_m"] = goal[:3, 3].tolist()
                         target["target_rpy_rad"] = Rotation.from_matrix(goal[:3, :3]).as_euler("xyz").tolist()
                         travel_limited = True
+                    effective_path = ControlSitePath(start, goal, target.get("control_offset_m", [0., 0., 0.]))
+                    limits = MotionLimits.from_config(self.installation.calibration.arms[n].motion_limits.model_dump())
+                    minimum_duration = max(minimum_duration, effective_path.minimum_duration(limits))
             entry_recovery = None
             try:
                 if self.robot.motion_validation == "command_limits":
@@ -335,9 +343,8 @@ class ArmBody:
             gripper_duration = max(abs(targets[n]["gripper_opening"] - gripper_start[n]) /
                                    self.installation.calibration.arms[n].motion_limits.gripper_speed_fraction_s for n in before)
             # Preserve the shared hold/grasp/release duration and bounded gripper slew.
-            while sum(durations) < max(gripper_duration, minimum_duration):
-                path.append({n: q.copy() for n, q in path[-1].items()})
-                durations.append(period)
+            scale = max(1., max(gripper_duration, minimum_duration) / sum(durations))
+            durations = [duration * scale for duration in durations]
             # A time-bounded prefix is a new, fully checked command. Its receipt
             # requires a fresh observation and new model plan, never automatic replay.
             available = deadline - time.monotonic() - self.robot.stop_timeout_s
@@ -365,8 +372,12 @@ class ArmBody:
                 elapsed = 0.
                 completed_segments = 0
                 residual_prefix = False
+                duration_prefix = False
+                prefix_details = None
                 last_target = path[0]
                 command_trace = []
+                path_started_at = time.monotonic()
+                next_command_at = path_started_at
                 guards = {n: PoseTrackingGuard(self.tracking_limits,
                     int(data["timing"]["received_monotonic_ns"]) / 1e9, self._tracking_pose(n, data))
                     for n, data in current.items()}
@@ -379,52 +390,65 @@ class ArmBody:
                             if cancel.is_set() or self._blocked.is_set() or time.monotonic() >= deadline:
                                 raise InterruptedError("Path interrupted before segment dispatch")
 
-                        segment_start = {n: np.asarray(self._require_feedback(n)["joints_rad"]) for n in row}
-                        if not self.geometry.check_measured_segment(segment_start, row, checkpoint=motion_checkpoint):
-                            if not submitted:
-                                raise DeviceError(ErrorCode.LIMIT_VIOLATION,
-                                    "Measured start exceeds next command step", stage="preflight")
-                            # Do not jump from a lagging arm to an assumed waypoint.
-                            # Finish the known prefix and request a fresh plan.
-                            residual_prefix = True
-                            break
-                        # A measured-start connection may be longer than the
-                        # nominal segment. Preserve the same command rate limits.
-                        for name in row:
-                            limits = MotionLimits.from_config(self.installation.calibration.arms[name].motion_limits.model_dump())
-                            dp, angle = distance(self.geometry.fk(name, segment_start[name]), self.geometry.fk(name, row[name]))
-                            duration = max(duration, 1.875 * float(np.max(np.abs(row[name]-segment_start[name]))) /
-                                           limits.joint_speed_rad_s, limits.eef_duration_s(dp, angle))
-                        if time.monotonic() + duration + self.robot.stop_timeout_s >= deadline:
-                            if not submitted:
-                                raise DeviceError(ErrorCode.LIMIT_VIOLATION,
-                                    "Measured segment exceeds remaining duration", stage="preflight")
-                            truncated = True
-                            break
-                        for name, q in row.items():
-                            if cancel.is_set() or self._blocked.is_set():
-                                raise InterruptedError("Stop during group submission")
-                            c = self.installation.calibration.arms[name]
-                            fraction = min(1., (elapsed + duration) / max(gripper_duration, 1e-9))
-                            command = gripper_start[name] + fraction * (targets[name]["gripper_opening"] - gripper_start[name])
-                            opening = c.gripper_closed_m + command * (c.gripper_open_m - c.gripper_closed_m)
-                            submitted = True  # A thrown write may already have transmitted frames.
-                            record = {"arm": name, "segment": index, "sent_realtime_ns": str(time.time_ns()),
-                                      "target_joints_rad": q.tolist(), "opening_m": opening,
-                                      "measured_start_rad": segment_start[name].tolist(), "send_outcome": "unknown"}
-                            command_trace.append(record)
-                            guards[name].sent(time.monotonic(), self._tracking_target(name, q))
-                            self._writers[name].move(q, opening, c.gripper_effort)
-                            record["send_outcome"] = "transport_returned"
-                        final_sent_at = time.monotonic()
-                        last_target = row
-                        end = time.monotonic() + duration
-                        while time.monotonic() < end:
-                            if cancel.wait(.005) or self._blocked.is_set() or time.monotonic() >= deadline:
-                                raise InterruptedError("Path interrupted")
+                        # Follow the checked joint interval at bounded speed. Each tick
+                        # connects fresh feedback to the next small command, avoiding
+                        # an unnecessary measured-to-distant-waypoint jump.
+                        ticks = 1 if entry_recovery is not None else max(1, math.floor(duration / period))
+                        tick_s = duration / ticks
+                        segment_start = path[index - 1]
+                        for tick in range(1, ticks + 1):
+                            # Include feedback and transport work in the fixed schedule.
+                            end = min(max(path_started_at + elapsed + tick * tick_s, next_command_at),
+                                      deadline - self.robot.stop_timeout_s)
+                            while time.monotonic() < end:
+                                if cancel.wait(min(.005, max(0., end - time.monotonic()))):
+                                    raise InterruptedError("Path interrupted")
+                                motion_checkpoint()
+                                actual = {n: self._require_feedback(n) for n in row}
+                                self.geometry.check({n: data["joints_rad"] for n, data in actual.items()}, measured=True)
+                                self._check_pose_tracking(guards, actual, segment=index)
                             actual = {n: self._require_feedback(n) for n in row}
                             self.geometry.check({n: data["joints_rad"] for n, data in actual.items()}, measured=True)
                             self._check_pose_tracking(guards, actual, segment=index)
+                            measured_tick = {n: np.asarray(data["joints_rad"]) for n, data in actual.items()}
+                            fraction = tick / ticks
+                            blend = fraction**3 * (10 + fraction * (-15 + 6 * fraction))
+                            command_row = {n: segment_start[n] + blend * (row[n] - segment_start[n]) for n in row}
+                            if not self.geometry.check_measured_segment(measured_tick, command_row, checkpoint=motion_checkpoint):
+                                prefix_details = {"segment": index, "tick": tick,
+                                                  "connections": self.geometry.command_step_evidence(measured_tick, command_row)}
+                                if not submitted:
+                                    raise DeviceError(ErrorCode.LIMIT_VIOLATION,
+                                        "Measured start exceeds next command step", stage="preflight", details=prefix_details)
+                                residual_prefix = True
+                                break
+                            if time.monotonic() + self.robot.stop_timeout_s >= deadline:
+                                if not submitted:
+                                    raise DeviceError(ErrorCode.LIMIT_VIOLATION,
+                                        "Remaining action time cannot cover stopping", stage="preflight")
+                                duration_prefix = True
+                                break
+                            next_command_at = time.monotonic() + period
+                            for name, q in command_row.items():
+                                motion_checkpoint()
+                                c = self.installation.calibration.arms[name]
+                                gripper_fraction = min(1., (elapsed + fraction * duration) / max(gripper_duration, 1e-9))
+                                command = gripper_start[name] + gripper_fraction * (targets[name]["gripper_opening"] - gripper_start[name])
+                                opening = c.gripper_closed_m + command * (c.gripper_open_m - c.gripper_closed_m)
+                                submitted = True
+                                record = {"arm": name, "segment": index, "tick": tick, "ticks": ticks,
+                                          "sent_realtime_ns": str(time.time_ns()), "target_joints_rad": q.tolist(),
+                                          "opening_m": opening, "measured_start_rad": measured_tick[name].tolist(),
+                                          "send_outcome": "unknown"}
+                                command_trace.append(record)
+                                self._writers[name].move(q, opening, c.gripper_effort)
+                                record["send_outcome"] = "transport_returned"
+                                guards[name].sent(time.monotonic(), self._tracking_target(name, q))
+                            final_sent_at = time.monotonic()
+                            last_target = command_row
+                        if residual_prefix or duration_prefix:
+                            elapsed += (tick - 1) * tick_s
+                            break
                         progress(index / (len(path) - 1))
                         elapsed += duration
                         completed_segments += 1
@@ -447,15 +471,17 @@ class ArmBody:
                                 "feedback_samples": windows[n].samples,
                                 "controller_target_reached": data.get("controller_target_reached")}
                         if all(row["verified"] for row in arrivals.values()):
-                            return {"requested_targets_reached": not (truncated or travel_limited or residual_prefix or entry_recovery is not None), "robot_id": self.robot.robot_id,
+                            return {"requested_targets_reached": not (truncated or duration_prefix or travel_limited or residual_prefix or entry_recovery is not None), "robot_id": self.robot.robot_id,
                                     "prefix_reason": "joint_entry_recovery" if entry_recovery is not None else "measured_start_step" if residual_prefix else
-                                        "action_duration" if truncated else "travel_budget" if travel_limited else None,
+                                        "action_duration" if truncated or duration_prefix else "travel_budget" if travel_limited else None,
+                                    "prefix_details": prefix_details,
+                                    "path_reference": "registered_control_site",
+                                    "motion_validation": self.robot.motion_validation,
+                                    "collision_checked": self.robot.motion_validation == "collision",
                                     "planned_segments": completed_segments, "planned_duration_s": elapsed,
                                     "arrival": arrivals,
                                     "command_trace": command_trace,
                                     "tracking_limits": self.tracking_limits.to_dict(),
-                                    "motion_validation": self.robot.motion_validation,
-                                    "collision_checked": self.robot.motion_validation == "collision",
                                     "completion_basis": "consecutive_fresh_target_feedback_after_final_command"}
                         if cancel.wait(.01) or self._blocked.is_set():
                             raise InterruptedError("Interrupted during final arrival")

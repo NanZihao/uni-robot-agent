@@ -401,7 +401,9 @@ class Adapter:
                 messages = [(op.get("error") or {}).get("message", "Native preflight rejected the target")
                             for op in error.operations.values() if op["state"] == "failed"]
                 diagnostics = {"reason": "command_limit", "operations": error.operations,
-                    "message": "; ".join(messages)}
+                    "message": "; ".join(messages),
+                    "planning_errors": [{"device_ids": op.get("device_ids", []), **(op.get("error") or {})}
+                                        for op in error.operations.values() if op["state"] == "failed"]}
                 if all(op["state"] == "failed" for op in error.operations.values()):
                     self.steps -= 1  # Every member explicitly reports no execution.
                     executed = "none"
@@ -489,6 +491,7 @@ class Adapter:
                            "hold_reports": result.get("hold_reports", {})}
             if prefix:
                 diagnostics["prefix_reason"] = result.get("prefix_reason")
+                diagnostics["prefix_details"] = result.get("prefix_details")
                 diagnostics["message"] = ("Body executed the reachable part of this path. Inspect the measured "
                                           "pose and prefix reason, observe again and plan a new target.")
             return diagnostics

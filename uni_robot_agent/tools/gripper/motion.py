@@ -196,7 +196,10 @@ def _pose(values) -> Pose:
 
 def _rejection_evidence(diagnostics: dict) -> dict:
     """Keep the failed planning evidence; full diagnostics live in primitive receipts."""
-    evidence = {key: diagnostics[key] for key in ("reason", "arm", "solver", "message") if key in diagnostics}
+    evidence = {key: diagnostics[key] for key in (
+        "reason", "arm", "solver", "message", "planning_errors", "prefix_reason", "prefix_details",
+        "goal_joint_check",
+    ) if key in diagnostics}
     arms = {
         name: {key: item[key] for key in (
             "ik_status", "max_joint_delta_rad", "joint_delta_limit_rad", "exceeded_joint_indices", "recovery",

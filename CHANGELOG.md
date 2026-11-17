@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Improve Piper-X registered-grasp-site interpolation, bounded analytic-Jacobian
+  IK with a 2 mm optimized position tolerance, and adaptive path sampling. Stream
+  checked joint intervals with quintic commands and measured per-tick admission.
+  Preserve native planning residuals and prefix causes through shared gripper
+  feedback. Upgrade the planner, environment and Body runtimes together.
+
 - Share precise local-computation cancellation guidance across Clean, Direct,
   Hybrid and Code as Policy instead of limiting it to Code as Policy.
 

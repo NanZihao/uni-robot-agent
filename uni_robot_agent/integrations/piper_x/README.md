@@ -54,6 +54,11 @@ remain in controller coordinates. This is software kinematic calibration, not
 a firmware zero reset. FK, IK, link collision transforms and image-time wrist
 poses use the same per-arm model. The other arm's model is unaffected.
 
+IK accepts an initial seed within 1 mm position and 0.02 rad orientation error.
+Otherwise it runs bounded optimization and accepts a final position residual
+up to 2 mm with the same orientation threshold. This can admit targets previously
+rejected between 1 and 2 mm. Path and measured-arrival checks still apply.
+
 With a nonzero correction, Body EEF feedback, tracking and Cartesian arrival use
 `FK_corrected(q) @ inverse(FK_nominal(q)) @ native_flange`. This preserves the
 native pose residual while applying the calibrated geometry. Unmodified native
@@ -182,6 +187,54 @@ command limit is 24 path segments. `grasp`, `release` and `hold` preserve their
 control-period duration through `min_duration_s`. Bounded prefixes report
 confirmed progress; unknown execution is never replayed. The shared replanning
 executor owns observation barriers after failed actions.
+
+### Registered-site planning and diagnostics
+
+Cartesian requests interpolate the registered grasp-site position linearly and
+orientation along the shortest SO(3) arc. Body converts every sampled site pose
+to its flange pose using `control_offset_m`. Calls that omit the offset retain
+a zero-offset flange reference. Work and duration bounds include rotational
+control-offset travel and acceleration.
+
+Installations retain the default `motion_validation=collision` profile. The
+commissioned `command_limits` profile is also supported with explicit operator
+supervision, native range/step checks and a separate near-bound entry receipt.
+Its descriptions and audits expose `collision_checking_enabled=false`.
+
+The planner caches the calibrated serial chain and uses an analytic geometric
+Jacobian with SciPy's bounded trust-region solver. Native joint bounds apply
+throughout the search. The seed fast path uses 1 mm / 0.02 rad tolerances and
+optimized candidates use 2 mm / 0.02 rad. Path sampling refines joint changes
+above 0.15 rad, with at most five refinement levels and 512 sampled intervals
+inside the existing cancellation/time budget. Collision mode applies configured
+swept-volume checks to each admitted connection. Command-limit mode applies
+native range and step bounds.
+A failed local solve returns the failed path fraction, position/rotation
+residuals, candidate joints and active bounds. Endpoint-only checks try the last
+verified and measured-start seeds and report their limited search basis.
+
+Execution publishes quintic samples along the checked joint intervals at the
+configured control frequency. Each sample validates the connection from fresh
+measured joints and keeps tracking, stopping and final-arrival verification.
+Command ticks use a fixed time base, including feedback and transport work in
+each period. Feedback checks continue between command submissions.
+A lagging arm can complete a checked interval through smaller commands. A
+connection that exceeds its bounds ends the acknowledged prefix at the last
+sent target, with `prefix_reason=measured_start_step` and `prefix_details`
+containing the measured/target deltas and limits. Unknown sends retain their
+uncertain outcome and receipt identity.
+
+Environment diagnostics expose `planning_errors`, `prefix_reason` and
+`prefix_details` in the shared tools' `feedback.stop_evidence`. These additive
+fields require matching planner, environment and native runtime versions for
+end-to-end visibility. Historical evaluation records keep their original source
+revision and behavior. Validate a new deployment with offline replay and a
+separately identified operator-supervised hardware trial.
+
+A fresh moving sample after native prefix arrival can leave `stop_confirmed`
+unset and the shared replanning gate in `operator_required`. Later observations
+can show stillness while the gate continues to require operator recovery. This
+prefix-recovery limitation remains open.
 
 Stop the environment with Ctrl-C or SIGTERM. Like ARX, its exit handler calls
 `backend.finish("operator_cancelled")` on a separate thread outside the action

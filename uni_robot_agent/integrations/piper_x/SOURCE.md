@@ -26,3 +26,8 @@ installed SDK version, driver source hash, firmware profile and reported version
 
 No vendor SDK, binary, URDF, mesh, measured calibration or evaluation output is
 bundled. Evaluation uses the official UNI CLI; there is no private task runner.
+
+Registered-site Cartesian interpolation and adaptive preflight refinement follow
+the repository's ARX ONE `ControlSitePath` and `EefPreflight` contracts. The
+Piper implementation retains its own URDF, calibrated controller coordinates,
+SciPy solver, joint-command transport and swept-volume validation.
